@@ -1,0 +1,276 @@
+**Prompt für Codex (vollständige Spezifikation):**
+
+You are an expert Python developer.
+Build a **local desktop GUI app** to train a **style LoRA** for image generation models (e.g. SD 1.5 or SDXL). The main goal: the user selects a folder with images, enters a generic style token (e.g. `laura-style`), clicks a button, and the app trains a LoRA and saves a `*.safetensors` file.
+
+Implement everything in **Python** with a **Qt-based GUI** and a **simple training backend** based on Hugging Face `diffusers` and `peft` (LoRA). Target OS: **Linux first**, but code should be portable to Windows/macOS.
+
+---
+
+### 1. Tech stack & project structure
+
+Use:
+
+* Python 3.10+
+* `PyQt6` for the GUI
+* `torch`, `diffusers`, `transformers`, `peft`, `accelerate`, `safetensors`
+* Optional but nice: `tqdm` for progress reporting in console/log
+
+Project layout:
+
+```text
+lora_trainer_gui/
+  main.py                # entry point, starts the GUI
+  gui_app.py             # PyQt6 windows, widgets, signal/slot wiring
+  training.py            # LoRA training logic (no GUI code)
+  config.py              # default hyperparameters and paths
+  requirements.txt
+  README.md
+```
+
+Do **not** mix GUI and training logic. `training.py` must be completely independent of PyQt and only expose clean Python functions/classes.
+
+---
+
+### 2. Functional requirements (GUI behaviour)
+
+The main window should contain:
+
+1. **Model configuration section**
+
+   * Dropdown to select **base model type**:
+
+     * `SD 1.5`
+     * `SDXL`
+   * Text field (with “Browse…” button) for the **base model path**:
+
+     * either local checkpoint (`.safetensors/.ckpt`)
+     * or a Hugging Face model ID (e.g. `stabilityai/stable-diffusion-xl-base-1.0`)
+   * Text field (with “Browse…” button) for the **output folder**
+     (where the LoRA `.safetensors` file will be saved).
+
+2. **Dataset section**
+
+   * Folder picker for the **image folder** (required).
+   * Optional checkbox: “Use captions from `.txt` files next to images”
+
+     * If checked: for each `image.xxx`, look for `image.txt` and use its contents as caption.
+     * If not checked: use a **single generic caption** (see next point).
+   * Text field for **generic style token** (e.g. `laura-style`) – required.
+
+     * This token should be included in all prompts used during training.
+
+3. **Training parameters section**
+
+   * Resolution (int): default `768` (for SDXL) or `512` (for SD 1.5).
+   * LoRA rank (int): default `32`.
+   * Learning rate (float): default `1e-4`.
+   * Number of epochs (int): default `10`.
+   * Batch size (int): default `1`.
+   * Checkbox “Use gradient checkpointing” (default ON).
+   * Checkbox “Enable mixed precision (fp16)” (default ON).
+   * Optional: max training steps (int, can be empty → auto-computed from dataset size × epochs).
+
+4. **Control section**
+
+   * `Start Training` button (disabled while training is running).
+   * `Cancel Training` button (disabled when no training is running).
+   * A **multi-line log/output panel** (read-only text area) displaying:
+
+     * validation errors (e.g. “No image folder selected”)
+     * basic training info (“Starting epoch 1/10”, “Saving checkpoint …”)
+     * error messages/exceptions.
+
+5. **Status display**
+
+   * A simple status bar or label with:
+
+     * “Idle”
+     * “Training: epoch X/Y, step i/N”
+     * “Finished”
+     * “Error: <message>”
+
+The GUI must remain responsive during training; do **not** block the main thread.
+
+---
+
+### 3. Non-functional requirements
+
+* No training should start if:
+
+  * image folder is missing or empty
+  * style token is empty
+  * base model information is missing
+  * output folder is missing
+
+* On such errors, show a clear messagebox **and** log message.
+
+* Fail fast: do not silently ignore missing configuration.
+
+* Training must run in a **background thread** or by using `QThread`/`QRunnable`:
+
+  * GUI must not freeze.
+  * Provide a clean way to cancel training:
+
+    * Set a `stop_requested` flag checked in the training loop.
+    * When cancellation is requested, stop the loop after the current step, update status, and return.
+
+* At the end of successful training:
+
+  * Save the final LoRA weights as a `.safetensors` file into the selected output folder.
+  * The filename should include:
+
+    * the style token
+    * a timestamp (e.g. `YYYYMMDD_HHMM`)
+  * Example: `laura-style_20251127_2030.safetensors`.
+
+---
+
+### 4. Training backend (high-level design)
+
+Implement the core LoRA training in `training.py`.
+
+Design a function like:
+
+```python
+def train_lora(
+    base_model: str,
+    model_type: str,  # "sd15" or "sdxl"
+    image_dir: Path,
+    output_dir: Path,
+    style_token: str,
+    use_captions: bool,
+    resolution: int,
+    lora_rank: int,
+    learning_rate: float,
+    num_epochs: int,
+    batch_size: int,
+    use_gradient_checkpointing: bool,
+    use_fp16: bool,
+    max_train_steps: Optional[int],
+    progress_callback: Optional[Callable[[str], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    stop_flag: Optional[Callable[[], bool]] = None,
+) -> Path:
+    """Train a style LoRA and return the path to the saved .safetensors file."""
+```
+
+Rules:
+
+* `progress_callback(msg: str)` is called regularly with human-readable messages (for the GUI to append to the log).
+* `status_callback(msg: str)` is used for coarse-grained status updates (e.g. “epoch 3/10”).
+* `stop_flag()` returns `True` if cancellation was requested; the training loop must check this frequently and exit gracefully.
+
+Training steps:
+
+1. **Dataset loading**
+
+   * Iterate over all image files in `image_dir` (common extensions: `.png`, `.jpg`, `.jpeg`, `.webp`).
+   * For each image:
+
+     * load and resize/crop to the given `resolution` (keep aspect ratio, center crop).
+     * build caption:
+
+       * if `use_captions` and a `.txt` file with same stem exists → read that.
+       * otherwise: use a generic caption, for example:
+         `"a painting in the style of {style_token}"`.
+   * Build a simple PyTorch `Dataset` and `DataLoader`.
+
+2. **Model loading**
+
+   * If `model_type == "sd15"`:
+
+     * use `StableDiffusionPipeline` from `diffusers` with the given base model.
+   * If `model_type == "sdxl"`:
+
+     * use `StableDiffusionXLPipeline`.
+   * Enable/disable fp16 according to `use_fp16` and GPU availability.
+   * Apply LoRA using `peft` or the diffusers built-in LoRA utilities:
+
+     * wrap the UNet (and optionally text encoder) with LoRA layers using the provided `lora_rank`.
+
+3. **Training loop**
+
+   * Use standard diffusion training structure:
+
+     * encode image to latents with VAE
+     * sample noise and timesteps
+     * predict noise with UNet
+     * compute MSE loss
+   * Use `AdamW` or `AdamW8bit` optimizer with given `learning_rate`.
+   * Use standard LR scheduler (e.g. cosine or linear).
+   * Loop over epochs and steps:
+
+     * on each step:
+
+       * check `stop_flag` → if `True`, break out and mark as cancelled.
+       * update model parameters.
+       * periodically call `progress_callback`.
+   * Honor `max_train_steps` if provided; otherwise derive from dataset size × epochs.
+
+4. **Saving LoRA weights**
+
+   * After training (and if not cancelled), extract the LoRA state dict and save it as a `.safetensors` file in `output_dir`.
+   * Return the path of this file from `train_lora`.
+
+Handle exceptions inside `train_lora` by re-raising them; do not swallow errors. The GUI layer is responsible for catching exceptions and showing message boxes + log entries.
+
+---
+
+### 5. GUI–training integration
+
+In `gui_app.py`:
+
+* Create a `MainWindow` class (subclass of `QMainWindow`).
+
+* On click of `Start Training`:
+
+  1. Validate all fields (image folder exists, non-empty; base model set; output folder exists or is creatable; style token non-empty).
+  2. Disable `Start Training`, enable `Cancel Training`.
+  3. Spawn a worker thread (`QThread` or `QRunnable`) that calls `train_lora()` with current settings.
+  4. Provide callbacks that emit Qt signals back to the GUI thread to update log/status widgets.
+
+* On click of `Cancel Training`:
+
+  * set a thread-safe flag (`stop_requested = True`) read by `stop_flag()` in `train_lora`.
+
+* When the worker finishes:
+
+  * if success: show a messagebox “Training finished. LoRA saved to: …”, log message, status “Finished”.
+  * if cancelled: status “Cancelled”, log message.
+  * if error: status “Error”, show messagebox with error text and log it.
+  * re-enable `Start Training`, disable `Cancel Training`.
+
+Make sure all UI updates happen in the GUI thread (use signals/slots).
+
+---
+
+### 6. UX details
+
+* Pre-fill reasonable defaults:
+
+  * model type: `SDXL`
+  * resolution: `1024`
+  * LR: `1e-4`
+  * epochs: `10`
+  * rank: `32`
+  * batch size: `1`
+* Remember the last used folders and settings in a simple JSON config file in the user’s home directory (e.g. `~/.lora_trainer_gui_config.json`).
+* In the log panel, prepend log lines with a short timestamp `[HH:MM:SS]`.
+
+---
+
+### 7. Deliverables
+
+* Fully working `main.py` that starts the GUI.
+* All Python modules (`gui_app.py`, `training.py`, `config.py`) implemented.
+* `requirements.txt` listing all dependencies with reasonable version pins.
+* A short `README.md` with:
+
+  * how to create a venv
+  * how to `pip install -r requirements.txt`
+  * how to run `python main.py`
+  * a minimal “how to use” section (select image folder, enter style token, start training, resulting LoRA file).
+
+Focus on **clear structure**, **robust error handling**, and **a simple, understandable GUI**.
+
